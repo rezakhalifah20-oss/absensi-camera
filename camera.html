@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>Kamera Absensi</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#102c3b;color:#fff;font-family:Arial,Helvetica,sans-serif;min-height:100vh}
+    .wrap{width:min(100%,560px);margin:0 auto;padding:18px}
+    .card{background:#fff;color:#17232d;border-radius:18px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.25)}
+    .head{padding:18px 20px;border-bottom:1px solid #e8edf0}
+    .head h1{font-size:20px;margin:0 0 5px}
+    .head p{margin:0;color:#6b7780;font-size:13px}
+    .camera{position:relative;background:#071923;aspect-ratio:3/4;overflow:hidden}
+    video{width:100%;height:100%;display:block;object-fit:cover;transform:scaleX(-1)}
+    canvas{display:none}
+    .overlay{position:absolute;left:0;right:0;bottom:0;padding:58px 18px 18px;background:linear-gradient(transparent,rgba(0,0,0,.78));text-shadow:0 1px 2px #000;font-size:13px;line-height:1.55;pointer-events:none}
+    .overlay .name{font-size:18px;font-weight:700}
+    .status{padding:12px 16px;background:#f6f8f9;color:#33434d;font-size:13px;line-height:1.45}
+    .status.ok{color:#176b45}.status.err{color:#9b2c2c}
+    .actions{display:flex;gap:10px;padding:16px}
+    button{flex:1;border:0;border-radius:11px;padding:13px 14px;font-weight:700;font-size:14px;cursor:pointer}
+    button.primary{background:#e9a52d;color:#17232d}
+    button.secondary{background:#e8eef1;color:#24333c}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .help{padding:0 16px 16px;color:#69767f;font-size:12px;line-height:1.5}
+    .hidden{display:none!important}
+    .spinner{width:18px;height:18px;border:3px solid #d7dee2;border-top-color:#0b5d5a;border-radius:50%;display:inline-block;vertical-align:-5px;animation:spin .8s linear infinite;margin-right:7px}
+    @keyframes spin{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="head">
+        <h1>📷 Kamera Absensi</h1>
+        <p id="identity">Menyiapkan kamera...</p>
+      </div>
+
+      <div class="camera">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+        <div class="overlay">
+          <div class="name" id="ov-name">-</div>
+          <div>NIP: <span id="ov-nip">-</span></div>
+          <div><span id="ov-date">-</span> · <span id="ov-time">-</span></div>
+          <div>GPS: <span id="ov-gps">Mencari lokasi...</span></div>
+        </div>
+      </div>
+
+      <div id="status" class="status"><span class="spinner"></span> Meminta izin kamera dan lokasi...</div>
+
+      <div class="actions">
+        <button id="btn-switch" class="secondary" type="button">🔄 Ganti Kamera</button>
+        <button id="btn-capture" class="primary" type="button" disabled>📸 Ambil Foto</button>
+      </div>
+      <div class="help">
+        Foto hanya dapat diambil dari kamera live. Tidak tersedia tombol unggah dari galeri.
+        Setelah foto berhasil, halaman ini akan mengirim foto dan koordinat GPS kembali ke aplikasi absensi.
+      </div>
+    </div>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  var params = new URLSearchParams(location.search);
+  var nonce = params.get('nonce') || '';
+  var opener = window.opener;
+  var stream = null;
+  var devices = [];
+  var deviceIndex = 0;
+  var currentDeviceId = '';
+  var user = { nama: '-', nip: '-' };
+  var lat = null, lng = null;
+  var cameraReady = false, gpsReady = false;
+  var sent = false;
+
+  var $ = function(id){ return document.getElementById(id); };
+
+  function send(type, extra) {
+    if (!opener || opener.closed) return;
+    var data = { type: type, nonce: nonce };
+    extra = extra || {};
+    Object.keys(extra).forEach(function(k){ data[k] = extra[k]; });
+    try { opener.postMessage(data, '*'); } catch (e) {}
+  }
+
+  function setStatus(text, cls) {
+    var el = $('status');
+    el.className = 'status' + (cls ? ' ' + cls : '');
+    el.innerHTML = text;
+  }
+
+  function error(code, text) {
+    setStatus(text, 'err');
+    send('ABSENSI_CAMERA_STATUS', { status:'error', code:code });
+  }
+
+  function updateClock() {
+    var now = new Date();
+    $('ov-date').textContent = now.toLocaleDateString('id-ID');
+    $('ov-time').textContent = now.toLocaleTimeString('id-ID');
+  }
+  setInterval(updateClock, 1000);
+  updateClock();
+
+  function getErrorCode(err) {
+    var n = err && err.name;
+    if (n === 'NotAllowedError' || n === 'PermissionDeniedError') return 'CAMERA_DENIED';
+    if (n === 'NotFoundError' || n === 'DevicesNotFoundError') return 'CAMERA_NOT_FOUND';
+    if (n === 'NotReadableError' || n === 'TrackStartError') return 'CAMERA_BUSY';
+    if (n === 'SecurityError') return 'CAMERA_SECURITY';
+    if (n === 'TypeError') return 'CAMERA_UNSUPPORTED';
+    return 'UNKNOWN';
+  }
+
+  function stopStream() {
+    if (stream) {
+      stream.getTracks().forEach(function(t){ t.stop(); });
+      stream = null;
+    }
+    cameraReady = false;
+  }
+
+  function startCamera(deviceId) {
+    stopStream();
+    var constraints = {
+      audio: false,
+      video: deviceId ? { deviceId:{ exact:deviceId }, width:{ ideal:1280 }, height:{ ideal:720 } }
+                     : { facingMode:{ ideal:'user' }, width:{ ideal:1280 }, height:{ ideal:720 } }
+    };
+    setStatus('<span class="spinner"></span> Mengaktifkan kamera...');
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      error('CAMERA_UNSUPPORTED', 'Browser tidak mendukung akses kamera. Gunakan Chrome/Edge terbaru melalui HTTPS.');
+      return;
+    }
+
+    navigator.mediaDevices.getUserMedia(constraints).then(function(s) {
+      stream = s;
+      $('video').srcObject = stream;
+      return $('video').play();
+    }).then(function(){
+      cameraReady = true;
+      $('btn-capture').disabled = !(cameraReady && gpsReady);
+      setStatus(gpsReady ? 'Kamera dan GPS siap. Anda dapat mengambil foto.' : 'Kamera siap. Menunggu GPS...', gpsReady ? 'ok' : '');
+      send('ABSENSI_CAMERA_STATUS', { status:'camera-ready', gpsText: gpsReady ? lat.toFixed(5)+', '+lng.toFixed(5) : 'Mencari lokasi...' });
+      enumerateCameras();
+    }).catch(function(err){
+      error(getErrorCode(err), 'Gagal mengakses kamera: ' + (err && err.message ? err.message : 'izin kamera belum diberikan.'));
+    });
+  }
+
+  function enumerateCameras() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    navigator.mediaDevices.enumerateDevices().then(function(list){
+      devices = list.filter(function(d){ return d.kind === 'videoinput'; });
+      if (currentDeviceId) {
+        var found = devices.findIndex(function(d){ return d.deviceId === currentDeviceId; });
+        if (found >= 0) deviceIndex = found;
+      } else if (stream) {
+        var track = stream.getVideoTracks()[0];
+        currentDeviceId = track && track.getSettings ? (track.getSettings().deviceId || '') : '';
+        var idx = devices.findIndex(function(d){ return d.deviceId === currentDeviceId; });
+        if (idx >= 0) deviceIndex = idx;
+      }
+    }).catch(function(){});
+  }
+
+  function startGps() {
+    if (!navigator.geolocation) {
+      error('GPS_DENIED', 'Perangkat/browser tidak mendukung GPS.');
+      return;
+    }
+    $('ov-gps').textContent = 'Mencari lokasi...';
+    navigator.geolocation.getCurrentPosition(function(pos){
+      lat = pos.coords.latitude;
+      lng = pos.coords.longitude;
+      gpsReady = true;
+      $('ov-gps').textContent = lat.toFixed(5) + ', ' + lng.toFixed(5);
+      $('btn-capture').disabled = !cameraReady;
+      if (cameraReady) setStatus('Kamera dan GPS siap. Anda dapat mengambil foto.', 'ok');
+      send('ABSENSI_CAMERA_STATUS', { status:'gps-ready', gpsText:lat.toFixed(5)+', '+lng.toFixed(5) });
+    }, function(err){
+      gpsReady = false;
+      var msg = 'Lokasi tidak dapat diambil. Izinkan lokasi pada browser lalu tekan Coba Lagi.';
+      if (err && err.code === 1) msg = 'Izin lokasi ditolak. Klik ikon lokasi di address bar dan pilih Izinkan.';
+      error('GPS_DENIED', msg);
+    }, { enableHighAccuracy:true, timeout:15000, maximumAge:0 });
+  }
+
+  function capture() {
+    if (!cameraReady || !stream) return;
+    if (!gpsReady || lat === null || lng === null) {
+      setStatus('GPS belum siap. Tunggu beberapa detik lalu coba lagi.', 'err');
+      return;
+    }
+
+    var video = $('video');
+    if (!video.videoWidth || !video.videoHeight) {
+      setStatus('Kamera belum siap. Tunggu sebentar lalu coba lagi.', 'err');
+      return;
+    }
+
+    var canvas = $('canvas');
+    var maxW = 960;
+    var scale = Math.min(1, maxW / video.videoWidth);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    var ctx = canvas.getContext('2d');
+
+    // Karena preview dibuat mirror, foto juga dibuat mirror agar tampilan selfie alami.
+    ctx.save();
+    ctx.translate(canvas.width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+
+    var now = new Date();
+    var pad = canvas.width * 0.035;
+    var lines = [
+      user.nama || '-',
+      'NIP: ' + (user.nip || '-'),
+      now.toLocaleDateString('id-ID') + ' ' + now.toLocaleTimeString('id-ID'),
+      'GPS: ' + lat.toFixed(5) + ', ' + lng.toFixed(5)
+    ];
+    var lh = canvas.width * 0.045;
+    var boxH = lh * lines.length + pad * 1.4;
+    var grad = ctx.createLinearGradient(0, canvas.height-boxH, 0, canvas.height);
+    grad.addColorStop(0, 'rgba(0,0,0,0)');
+    grad.addColorStop(1, 'rgba(0,0,0,.72)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, canvas.height-boxH, canvas.width, boxH);
+    ctx.fillStyle = '#fff';
+    ctx.textBaseline = 'top';
+    lines.forEach(function(line, i){
+      ctx.font = (i === 0 ? 'bold ' : '') + (canvas.width * 0.038) + 'px Arial';
+      ctx.fillText(line, pad, canvas.height-boxH+pad*.7+i*lh);
+    });
+
+    var dataUrl = canvas.toDataURL('image/jpeg', 0.78);
+    sent = true;
+    setStatus('<span class="spinner"></span> Mengirim foto ke aplikasi absensi...');
+    $('btn-capture').disabled = true;
+    $('btn-switch').disabled = true;
+    stopStream();
+    send('ABSENSI_CAMERA_RESULT', { fotoBase64:dataUrl, lat:lat, lng:lng });
+    setTimeout(function(){ window.close(); }, 250);
+  }
+
+  window.addEventListener('message', function(event){
+    if (event.source !== opener) return;
+    var data = event.data || {};
+    if (data.nonce !== nonce) return;
+    if (data.type !== 'ABSENSI_CAMERA_INIT') return;
+    user = data.user || user;
+    $('ov-name').textContent = user.nama || '-';
+    $('ov-nip').textContent = user.nip || '-';
+    $('identity').textContent = (user.nama || '-') + ' · NIP ' + (user.nip || '-');
+    startGps();
+    startCamera('');
+  });
+
+  $('btn-capture').addEventListener('click', capture);
+  $('btn-switch').addEventListener('click', function(){
+    if (!devices.length) { enumerateCameras(); return; }
+    deviceIndex = (deviceIndex + 1) % devices.length;
+    currentDeviceId = devices[deviceIndex].deviceId;
+    startCamera(currentDeviceId);
+  });
+
+  // Handshake dengan Web App Apps Script.
+  if (!opener) {
+    setStatus('Halaman kamera harus dibuka dari aplikasi Absensi.', 'err');
+  } else if (!nonce) {
+    setStatus('Sesi kamera tidak valid. Tutup halaman ini dan buka kamera dari aplikasi Absensi.', 'err');
+  } else {
+    send('ABSENSI_CAMERA_READY');
+  }
+})();
+</script>
+</body>
+</html>
